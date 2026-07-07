@@ -8,8 +8,78 @@ human remembers to remove it. Fade moves that cleanup decision closer to the
 storage boundary: files receive a time-to-live, and the filesystem enforces
 that lifetime.
 
-Status: design and MVP planning. The public contract below describes the target
-behavior for the first production-quality release.
+Status: phase 1 implementation in progress. The repository now contains the
+first Rust implementation slice for the local developer-mode MVP. The public
+contract below still describes the target behavior for the first
+production-quality release.
+
+## Current Implementation
+
+Implemented in the current phase 1 slice:
+
+- Rust CLI crate with `fade mount`, `fade ls`, `fade status`, `fade gc`, and
+  `fade version`.
+- Developer-mode FUSE mount with TTL folders such as `1m`, `1h`, `24h`, `7d`,
+  `30d`, and `forever`.
+- SQLite metadata for path, TTL, expiry time, recovery deadline, lifecycle
+  state, policy source, and observed size.
+- Expiry checks for lookup, stat, open, read, write, rename, unlink, and normal
+  directory listings.
+- Background reaper plus manual `fade gc` for physically deleting expired files
+  after the recovery window.
+- Unit coverage for duration parsing, path safety, TTL assignment, metadata
+  lifecycle transitions, record rename/recreate behavior, and reaper deletion.
+
+Not implemented yet:
+
+- Policy mode and TOML rule matching.
+- `fade check` dry run.
+- `fade recover`.
+- Mountpoint discovery for inspection commands. For now `fade ls`, `fade
+  status`, and `fade gc` operate on the Fade backing directory.
+- End-to-end mount tests in CI. They require a Linux host with `/dev/fuse`
+  available.
+
+## Quickstart From Source
+
+Requirements:
+
+- Linux.
+- Rust 1.95 or newer.
+- FUSE runtime support for mounting, including `/dev/fuse` and `fusermount3` or
+  `fusermount`.
+
+Build and test:
+
+```bash
+cargo test
+cargo test --no-default-features
+cargo build
+```
+
+Run a developer-mode mount:
+
+```bash
+mkdir -p /tmp/fade-data /tmp/fade-mnt
+target/debug/fade mount /tmp/fade-data /tmp/fade-mnt --mode dev
+```
+
+The mount command stays in the foreground. In another terminal:
+
+```bash
+printf 'hello\n' > /tmp/fade-mnt/1m/hello.txt
+cat /tmp/fade-mnt/1m/hello.txt
+
+target/debug/fade ls /tmp/fade-data
+target/debug/fade status /tmp/fade-data
+target/debug/fade gc /tmp/fade-data
+```
+
+Unmount when finished:
+
+```bash
+fusermount3 -u /tmp/fade-mnt
+```
 
 ## Why Fade exists
 
