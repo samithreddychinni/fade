@@ -181,7 +181,9 @@ impl MetadataStore {
                     policy_source,
                     size_bytes
                 FROM files
-                WHERE path = ?1",
+                WHERE path = ?1
+                ORDER BY state = 'deleted', created_at DESC
+                LIMIT 1",
                 params![path.as_str()],
                 read_record,
             )
@@ -279,12 +281,64 @@ impl MetadataStore {
         Ok(())
     }
 
-    pub fn update_observed_size(&self, path: &RelativePath, size_bytes: u64, modified_at: i64) -> Result<()> {
+    pub fn mark_deleted_by_path(&self, path: &RelativePath) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files
+            SET state = 'deleted'
+            WHERE path = ?1
+              AND state != 'deleted'",
+            params![path.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn rename_path(&self, from: &RelativePath, to: &RelativePath, modified_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files
+            SET path = ?2,
+                backing_path = ?2,
+                modified_at = ?3
+            WHERE path = ?1
+              AND state != 'deleted'",
+            params![from.as_str(), to.as_str(), modified_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn rename_prefix(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+        modified_at: i64,
+    ) -> Result<()> {
+        let from_prefix = format!("{}/", from.as_str());
+        let to_prefix = format!("{}/", to.as_str());
+        let suffix_start = (from_prefix.len() + 1) as i64;
+
+        self.conn.execute(
+            "UPDATE files
+            SET path = ?2 || substr(path, ?3),
+                backing_path = ?2 || substr(backing_path, ?3),
+                modified_at = ?4
+            WHERE state != 'deleted'
+              AND path LIKE ?1 || '%'",
+            params![from_prefix, to_prefix, suffix_start, modified_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_observed_size(
+        &self,
+        path: &RelativePath,
+        size_bytes: u64,
+        modified_at: i64,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE files
             SET size_bytes = ?2,
                 modified_at = ?3
-            WHERE path = ?1",
+            WHERE path = ?1
+              AND state != 'deleted'",
             params![path.as_str(), size_bytes as i64, modified_at],
         )?;
         Ok(())
@@ -348,8 +402,8 @@ impl MetadataStore {
 
             CREATE TABLE IF NOT EXISTS files (
                 id TEXT PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE,
-                backing_path TEXT NOT NULL UNIQUE,
+                path TEXT NOT NULL,
+                backing_path TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 modified_at INTEGER NOT NULL,
                 ttl_seconds INTEGER,
@@ -365,6 +419,14 @@ impl MetadataStore {
 
             CREATE INDEX IF NOT EXISTS idx_files_state_recovery_deadline
             ON files(state, recovery_deadline);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_files_active_path
+            ON files(path)
+            WHERE state != 'deleted';
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_files_active_backing_path
+            ON files(backing_path)
+            WHERE state != 'deleted';
 
             CREATE TABLE IF NOT EXISTS runtime_state (
                 key TEXT PRIMARY KEY,
@@ -515,6 +577,71 @@ mod tests {
         assert_eq!(pending.expired_recoverable_files, 0);
         assert_eq!(pending.pending_deletion_files, 1);
         assert_eq!(pending.pending_deletion_bytes, 512);
+    }
+
+    #[test]
+    fn allows_recreating_deleted_paths() {
+        let temp = tempdir().unwrap();
+        let store = MetadataStore::open(temp.path().join("metadata.sqlite")).unwrap();
+        let first = sample_record("1h/output.txt", 10, Duration::from_secs(3_600));
+        let mut second = sample_record("1h/output.txt", 20, Duration::from_secs(3_600));
+
+        store.insert_file(&first).unwrap();
+        store.mark_deleted_by_path(&first.path).unwrap();
+        second.created_at = first.created_at + 1;
+        second.modified_at = first.modified_at + 1;
+        store.insert_file(&second).unwrap();
+
+        let loaded = store.get_by_path(&first.path).unwrap().unwrap();
+        assert_eq!(loaded.id, second.id);
+        assert_eq!(loaded.state, FileState::Alive);
+    }
+
+    #[test]
+    fn renames_active_file_records() {
+        let temp = tempdir().unwrap();
+        let store = MetadataStore::open(temp.path().join("metadata.sqlite")).unwrap();
+        let from = sample_record("1h/from.txt", 10, Duration::from_secs(3_600));
+        let to = RelativePath::new("1h/to.txt").unwrap();
+
+        store.insert_file(&from).unwrap();
+        store.rename_path(&from.path, &to, 200).unwrap();
+
+        assert!(store.get_by_path(&from.path).unwrap().is_none());
+        let loaded = store.get_by_path(&to).unwrap().unwrap();
+        assert_eq!(loaded.path, to);
+        assert_eq!(loaded.backing_path, to);
+        assert_eq!(loaded.modified_at, 200);
+    }
+
+    #[test]
+    fn renames_directory_prefix_records() {
+        let temp = tempdir().unwrap();
+        let store = MetadataStore::open(temp.path().join("metadata.sqlite")).unwrap();
+        let first = sample_record("1h/old/a.txt", 10, Duration::from_secs(3_600));
+        let second = sample_record("1h/old/nested/b.txt", 20, Duration::from_secs(3_600));
+
+        store.insert_file(&first).unwrap();
+        store.insert_file(&second).unwrap();
+        store
+            .rename_prefix(
+                &RelativePath::new("1h/old").unwrap(),
+                &RelativePath::new("24h/new").unwrap(),
+                200,
+            )
+            .unwrap();
+
+        let moved_first = RelativePath::new("24h/new/a.txt").unwrap();
+        let moved_second = RelativePath::new("24h/new/nested/b.txt").unwrap();
+        assert!(store.get_by_path(&first.path).unwrap().is_none());
+        assert_eq!(
+            store.get_by_path(&moved_first).unwrap().unwrap().path,
+            moved_first
+        );
+        assert_eq!(
+            store.get_by_path(&moved_second).unwrap().unwrap().path,
+            moved_second
+        );
     }
 
     fn sample_record(path: &str, size_bytes: u64, ttl: Duration) -> FileRecord {

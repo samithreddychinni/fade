@@ -109,7 +109,7 @@ fn init_tracing() {
 
 fn mount(
     backing_dir: &Path,
-    _mountpoint: &Path,
+    mountpoint: &Path,
     mode: MountMode,
     recovery_window: &str,
     reaper_interval: &str,
@@ -118,9 +118,9 @@ fn mount(
         bail!("policy mode is planned for v0.2; phase 1 only supports developer mode");
     }
 
-    let _recovery_window = parse_duration(recovery_window, true)
+    let recovery_window = parse_duration(recovery_window, true)
         .with_context(|| format!("invalid --recovery-window `{recovery_window}`"))?;
-    let _reaper_interval = parse_duration(reaper_interval, false)
+    let reaper_interval = parse_duration(reaper_interval, false)
         .with_context(|| format!("invalid --reaper-interval `{reaper_interval}`"))?;
 
     init_backing_dir(backing_dir)
@@ -128,7 +128,19 @@ fn mount(
     MetadataStore::open(metadata_db_path(backing_dir))
         .with_context(|| format!("failed to open metadata for `{}`", backing_dir.display()))?;
 
-    bail!("FUSE mounting is not wired in this build yet; metadata initialization completed")
+    #[cfg(feature = "fuse")]
+    {
+        return crate::fuse_fs::mount_dev(backing_dir, mountpoint, recovery_window, reaper_interval)
+            .with_context(|| format!("failed to mount `{}`", mountpoint.display()));
+    }
+
+    #[cfg(not(feature = "fuse"))]
+    {
+        let _ = mountpoint;
+        let _ = recovery_window;
+        let _ = reaper_interval;
+        bail!("this binary was built without FUSE support")
+    }
 }
 
 fn ls(path: &Path, json: bool) -> anyhow::Result<()> {
