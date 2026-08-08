@@ -63,6 +63,9 @@ impl DurationDisplay {
 
 pub fn parse_duration(input: &str, allow_zero: bool) -> Result<Duration> {
     let normalized = input.trim().to_ascii_lowercase();
+    if allow_zero && normalized == "0" {
+        return Ok(Duration::ZERO);
+    }
     let Some(unit) = normalized.chars().last() else {
         return invalid(input, "duration cannot be empty");
     };
@@ -158,6 +161,7 @@ mod tests {
     #[test]
     fn rejects_zero_ttl_but_allows_zero_recovery_duration() {
         assert!(Ttl::parse("0s").is_err());
+        assert_eq!(parse_duration("0", true).unwrap(), Duration::ZERO);
         assert_eq!(parse_duration("0s", true).unwrap(), Duration::from_secs(0));
     }
 

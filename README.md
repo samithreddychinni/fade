@@ -1,6 +1,6 @@
 # Fade
 
-Fade is a self-expiring filesystem for files that should not live forever.
+Fade gives Linux directories a time-to-live.
 
 Most filesystems treat time as metadata, not policy. A file created for a
 temporary job can sit on disk for years unless an application, cron job, or
@@ -8,10 +8,9 @@ human remembers to remove it. Fade moves that cleanup decision closer to the
 storage boundary: files receive a time-to-live, and the filesystem enforces
 that lifetime.
 
-Status: phase 1 implementation in progress. The repository now contains the
-first Rust implementation slice for the local developer-mode MVP. The public
-contract below still describes the target behavior for the first
-production-quality release.
+Status: working developer preview. The TTL-folder lifecycle is implemented, but
+Fade is not ready for important or irreplaceable data. The remaining v0.1 work
+is crash behavior and packaging.
 
 ## Current Implementation
 
@@ -29,6 +28,8 @@ Implemented in the current phase 1 slice:
   after the recovery window.
 - Unit coverage for duration parsing, path safety, TTL assignment, metadata
   lifecycle transitions, record rename/recreate behavior, and reaper deletion.
+- End-to-end FUSE lifecycle coverage for expiry, garbage collection, and
+  remount persistence.
 
 Not implemented yet:
 
@@ -37,8 +38,6 @@ Not implemented yet:
 - `fade recover`.
 - Mountpoint discovery for inspection commands. For now `fade ls`, `fade
   status`, and `fade gc` operate on the Fade backing directory.
-- End-to-end mount tests in CI. They require a Linux host with `/dev/fuse`
-  available.
 
 ## Quickstart From Source
 
@@ -55,6 +54,7 @@ Build and test:
 cargo test
 cargo test --no-default-features
 cargo build
+./tests/fuse_lifecycle.sh # requires /dev/fuse
 ```
 
 Run a developer-mode mount:
@@ -85,8 +85,8 @@ fusermount3 -u /tmp/fade-mnt
 
 Temporary files become permanent by accident.
 
-Build artifacts, exported reports, test fixtures, short-lived credentials,
-session dumps, and local scratch data often start with an obvious lifetime. The
+Build artifacts, exported reports, test fixtures, generated archives, and local
+scratch data often start with an obvious lifetime. The
 problem is that the lifetime is rarely attached to the file itself. Cleanup gets
 implemented later as a script, a scheduled job, or a runbook. Those approaches
 work until they are skipped, misconfigured, or forgotten.
@@ -101,10 +101,20 @@ Fade makes expiry part of the filesystem experience:
 - Operators can inspect what is alive, expired, recoverable, and pending
   deletion.
 
-The goal is not to replace secret managers, object storage lifecycle policies,
-or compliance programs. The goal is to provide a small, reliable filesystem
-primitive for local and server-side data that already belongs on disk, but
-should not stay there indefinitely.
+The goal is a small filesystem primitive for local data that belongs on disk
+for a known amount of time. Fade does not replace a secret manager, object
+storage lifecycle policy, backup policy, or compliance program.
+
+## Why a filesystem?
+
+Linux already has good cleanup tools. `systemd-tmpfiles` removes old files when
+a cleanup pass runs, and `tmpfs` drops an entire in-memory filesystem when it is
+unmounted. Use either when those semantics are enough.
+
+Fade is for the narrower case where a path must stop resolving on the next
+Fade-mediated access after its TTL expires, even if physical deletion happens
+later. Applications keep using normal file operations; the retention rule lives
+at the mount boundary.
 
 ## Core model
 
@@ -129,7 +139,7 @@ created -> alive -> expired -> recoverable -> deleted
 The recovery window is configurable. Strict deployments can set it to `0` so
 expired files are eligible for deletion immediately.
 
-## Planned usage
+## Usage model
 
 ### Developer mode
 
@@ -146,7 +156,7 @@ cp notes.txt ./mnt/forever/
 Files created under `24h/` live for 24 hours. Files created under `7d/` live for
 7 days. No application code needs to pass flags or call a Fade API.
 
-### Policy mode
+### Planned policy mode
 
 Policy mode uses a config file. It is intended for services and shared
 environments where expiry should be controlled centrally.
@@ -180,37 +190,30 @@ retention.
 
 ### Inspection
 
-Fade should make expiry visible without requiring operators to inspect the
-SQLite store directly.
+The implemented inspection commands expose expiry without requiring operators
+to inspect the SQLite store directly:
 
 ```bash
-fade ls ./mnt
-fade status ./mnt
-fade check --config fade.toml --path ./sample-data
-fade recover ./mnt/session_abc
-fade gc ./mnt
+fade ls ./fade-data
+fade status ./fade-data
+fade gc ./fade-data
 ```
 
-`fade check` is a dry run. It shows which rule would apply to each file before a
-team mounts Fade in a real environment.
+Mountpoint discovery, `fade check`, and `fade recover` are planned.
 
 ## Initial use cases
 
-Fade is intentionally narrow at first.
+Fade is intentionally narrow at first:
 
-- Build and CI artifact caches with bounded disk usage.
 - Local scratch directories that should clean themselves.
 - Temporary exports and reports.
-- Test data generated during development or continuous integration.
-- Short-lived service files where the application can write directly into a
-  Fade mount.
-- Container-mounted temporary files that should not outlive the workload.
+- Build and CI workspaces whose output has a known maximum age.
+- Generated test data that is safe to recreate.
 
-Security-sensitive use cases are in scope only when the limitations are
-understood. Fade can expire files inside its mount. It cannot delete copies from
-logs, backups, snapshots, shell history, editor swap files, or external systems.
-Future releases may add per-file encryption and key destruction for stronger
-erase semantics.
+The first public release should win these cases before expanding into
+service policy or security-sensitive data. Fade can expire files inside its
+mount. It cannot delete copies from logs, backups, snapshots, shell history,
+editor swap files, or external systems.
 
 ## What Fade is not
 
@@ -240,7 +243,7 @@ or deleting a file does not necessarily remove every physical copy.
 
 ## Planned architecture
 
-Fade will be implemented as a Linux FUSE filesystem written in Rust.
+Fade is implemented as a Linux FUSE filesystem written in Rust.
 
 The mounted filesystem will store file contents in a backing directory and TTL
 metadata in SQLite. Every filesystem operation that resolves a path will check
@@ -251,19 +254,18 @@ High-level components:
 
 - FUSE mount: path resolution, reads, writes, stats, renames, and directory
   listing behavior.
-- Policy engine: TTL folder parsing and config-rule matching.
+- Policy engine: TTL folder parsing, with config-rule matching planned.
 - Metadata store: SQLite records for path, TTL, creation time, expiry time,
   recovery deadline, state, and backing object location.
 - Reaper: periodic and manually triggered physical cleanup.
-- CLI: mount, inspect, dry-run, recover, and garbage-collect operations.
-- Observability: structured logs and machine-readable status output.
+- CLI: mount, inspect, and garbage-collect operations.
 
-Planned Rust stack:
+Rust stack:
 
 - `fuser` for FUSE integration.
 - `clap` for CLI parsing.
 - `rusqlite` for SQLite metadata.
-- `serde` and `toml` for configuration.
+- `serde` for machine-readable output.
 - `tracing` for structured logs.
 - `thiserror` and `anyhow` for error boundaries.
 
@@ -285,32 +287,22 @@ Planned Rust stack:
 - `fade check` dry run.
 - Config validation with clear error messages.
 - Rule precedence tests.
-- Recovery window support.
+- `fade recover` for the existing recovery window.
 
 ### v0.3: Production Hardening
 
 - Structured audit log.
-- Prometheus-compatible metrics or JSON status endpoint.
 - Crash recovery and startup reconciliation.
 - Rename, symlink, hard link, and open-file semantics documented and tested.
 - Packaging for common Linux distributions.
-
-### Later
-
-- Per-file encryption and cryptographic erase.
-- Kubernetes examples.
-- Systemd unit examples.
 - Benchmarks against direct filesystem access.
 
 ## Open design questions
 
 These questions should be answered before claiming production readiness.
 
-- What happens when a process opens a file before expiry and keeps the handle
-  open after expiry?
-- Should expired open handles fail immediately, continue until close, or be
-  configurable?
-- How should Fade handle `mmap`?
+- How should Fade handle buffered I/O and `mmap`, where data may already be in
+  the kernel or process address space when the TTL expires?
 - Are hard links allowed, rejected, or represented as shared metadata?
 - How are symlinks resolved, and can they escape the mount?
 - What are the exact guarantees after crash, remount, and metadata recovery?

@@ -22,3 +22,23 @@ jobs:
 
       - name: Test core without FUSE feature
         run: cargo test --locked --no-default-features
+
+  fuse-lifecycle:
+    name: FUSE lifecycle
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install FUSE
+        run: sudo apt-get update && sudo apt-get install -y fuse3
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Run lifecycle test
+        run: ./tests/fuse_lifecycle.sh

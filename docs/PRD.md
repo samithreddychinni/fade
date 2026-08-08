@@ -1,8 +1,8 @@
 # Fade Product Requirements Document
 
 Start Date: 2026-05-03
-Commit Date: Check in github
-Status: Draft for MVP implementation
+Last Updated: 2026-07-17
+Status: Working draft
 Owner: Project maintainers
 
 ## Summary
@@ -33,16 +33,18 @@ Common failure modes:
 Fade addresses the filesystem-local part of this problem by attaching expiry to
 files at creation time and enforcing it at access time.
 
-## Goals
+## Goals for v0.1
 
 - Provide a FUSE mount where files receive a TTL automatically.
 - Make expired files inaccessible through the mounted filesystem.
 - Reclaim disk space automatically through a background reaper.
 - Support a simple developer workflow using TTL folders.
-- Support a production workflow using centralized TOML rules.
-- Expose clear CLI inspection, dry-run, recovery, and cleanup commands.
+- Expose clear CLI inspection and cleanup commands.
 - Persist metadata across restarts.
 - Document operational limits honestly.
+
+Policy rules, dry runs, and recovery commands are v0.2 work. They should not
+delay a useful, testable TTL-folder release.
 
 ## Non-goals
 
@@ -63,10 +65,10 @@ cleanup scripts. Values simple folder-based behavior and quick feedback.
 
 ### Build and platform engineer
 
-Wants CI artifacts, generated reports, and caches to expire predictably. Values
-bounded disk usage, observability, and dry-run safety.
+Wants CI workspaces, generated reports, and recreatable artifacts to expire
+predictably. Values simple operation and visible lifecycle state.
 
-### Application operator
+### Application operator (v0.2)
 
 Wants a mounted path with retention behavior that does not depend on every
 application code path remembering to delete files. Values config-driven policy,
@@ -80,18 +82,18 @@ A developer mounts Fade locally and writes files into folders named `1h/`,
 `24h/`, `7d/`, and `forever/`. Fade applies the TTL based on the folder and
 expires files without extra commands.
 
-### CI artifact cache
+### CI workspace
 
-A CI worker stores generated artifacts in a Fade mount. Artifacts older than the
-configured TTL become inaccessible and are physically removed by the reaper.
+A CI worker stores generated output in a Fade mount. Output older than the
+configured TTL becomes inaccessible and is physically removed by the reaper.
 
-### Policy-controlled service output
+### Policy-controlled service output (v0.2)
 
 A service writes files into a mounted directory. Fade assigns TTLs using a TOML
 config, such as a first-match rule for `*.token` or `*.report`. The service
 does not call a Fade-specific API.
 
-### Recovery from accidental expiry
+### Recovery from accidental expiry (v0.2)
 
 An operator discovers that a file expired unintentionally. If the recovery
 window has not elapsed, `fade recover` restores the file to the alive state or
@@ -109,7 +111,7 @@ copies it to a recovery path.
   used as policy folders.
 - Fade MUST keep developer mode usable without requiring a config file.
 
-### Policy mode
+### Policy mode (v0.2)
 
 - Fade MUST support a TOML config file with ordered glob rules.
 - Fade MUST assign the first matching rule to newly created files.
@@ -150,8 +152,9 @@ recovery_window = "1h"
 - Fade MUST record the transition from alive to expired in metadata.
 - Fade MUST support a configurable recovery window.
 - Fade MUST support recovery window `0`.
-- Fade SHOULD document exact behavior for already-open file handles before the
-  first production release.
+- Reads and writes through an already-open handle MUST fail after expiry.
+- Fade MUST document that buffered data and `mmap` may outlive path-level
+  access because the kernel or process may already hold a copy.
 
 ### Reaper behavior
 
@@ -164,7 +167,7 @@ recovery_window = "1h"
 - Fade MUST provide `fade gc` to trigger an immediate reaper pass.
 - Fade MUST expose pending deletion counts and approximate pending bytes.
 
-### Recovery behavior
+### Recovery behavior (v0.2)
 
 - Fade MUST provide `fade recover` for files that are expired but still inside
   the recovery window.
@@ -177,8 +180,8 @@ recovery_window = "1h"
 - Fade MUST provide `fade ls` to show path, state, TTL, expiry time, and
   recovery deadline.
 - Fade MUST provide `fade status` with machine-readable output.
-- Fade MUST provide `fade check --config <file> --path <path>` to preview TTL
-  assignment without mounting.
+- In v0.2, Fade MUST provide `fade check --config <file> --path <path>` to
+  preview TTL assignment without mounting.
 - Fade SHOULD support JSON output for automation.
 
 ## CLI requirements
@@ -272,7 +275,7 @@ The production-ready release SHOULD define behavior for:
 
 Fade MUST provide enough information for operators to trust the system.
 
-Required metrics or status fields:
+Required v0.1 status fields:
 
 - Alive file count.
 - Expired recoverable file count.
@@ -281,10 +284,10 @@ Required metrics or status fields:
 - Last reaper run time.
 - Last reaper duration.
 - Last reaper error.
-- Next scheduled reaper run.
 - Metadata database path.
 - Backing directory path.
-- Config path and loaded config hash.
+
+Policy mode SHOULD also expose the config path and loaded config hash.
 
 Required audit events in policy mode:
 
@@ -321,23 +324,19 @@ Audit logs SHOULD be structured JSON Lines.
 - Fade SHOULD run with least privilege.
 - Fade SHOULD avoid storing secret file contents in logs.
 - Audit logs MUST avoid recording file contents.
-- Future secure erase work SHOULD use per-file encryption with key destruction
-  instead of relying on overwrite semantics.
 
 ## Performance requirements
 
 MVP performance should be good enough for development and CI workloads.
 
-Initial targets:
+Initial requirements:
 
 - Metadata lookup overhead should be small enough for normal CLI usage and
   moderate artifact directories.
-- Directory listing should remain usable with at least 10,000 files.
-- Reaper should process at least 10,000 expired metadata records per minute on a
-  typical developer machine.
 - Status commands should avoid full backing-store scans during normal operation.
 
-Benchmarking is required before claiming production performance.
+Publish measured baselines before setting numeric performance targets or
+claiming production performance.
 
 ## Compatibility requirements
 
@@ -392,7 +391,8 @@ The v0.2 release is acceptable when:
 - Invalid configs fail with clear errors.
 - `fade check` previews rule assignment.
 - Config rules override folder hints.
-- Recovery window behavior is implemented and tested.
+- `fade recover` restores an eligible expired file or copies it to a requested
+  recovery path.
 - Audit events are emitted for create, expire, recover, and delete.
 
 ## Launch plan

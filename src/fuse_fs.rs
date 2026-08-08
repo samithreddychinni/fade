@@ -50,7 +50,6 @@ pub fn mount_dev(
     let options = [
         MountOption::FSName("fade".to_string()),
         MountOption::Subtype("fade".to_string()),
-        MountOption::AutoUnmount,
         MountOption::DefaultPermissions,
         MountOption::NoDev,
         MountOption::NoSuid,
