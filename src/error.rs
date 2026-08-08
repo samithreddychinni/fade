@@ -23,6 +23,12 @@ pub enum FadeError {
     #[error("metadata size `{0}` cannot be represented")]
     InvalidSize(i64),
 
+    #[error("backing file `{path}` has no active metadata record")]
+    UntrackedBackingFile { path: PathBuf },
+
+    #[error("cannot recover pending rename from `{from}` to `{to}`")]
+    UnresolvedRename { from: PathBuf, to: PathBuf },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

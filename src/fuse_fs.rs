@@ -43,6 +43,7 @@ pub fn mount_dev(
 
     let db_path = metadata_db_path(backing_dir);
     let store = MetadataStore::open(&db_path)?;
+    crate::reaper::reconcile(&store, backing_dir)?;
     store.expire_due(now_unix_seconds())?;
 
     let reaper = ReaperThread::spawn(backing_dir.to_path_buf(), db_path, reaper_interval);
@@ -367,11 +368,6 @@ impl Filesystem for DevFuse {
             }
 
             let assignment = self.policy.assign_file(&path).map_err(errno_for_fade)?;
-            let backing_path = self.backing_path(&path)?;
-            let file = open_options(flags, true, (mode & !umask) & 0o7777)
-                .open(&backing_path)
-                .map_err(errno_for_io)?;
-
             let record = FileRecord::new(
                 path.clone(),
                 path.clone(),
@@ -383,10 +379,18 @@ impl Filesystem for DevFuse {
             )
             .map_err(errno_for_fade)?;
 
-            if let Err(error) = self.store.insert_file(&record) {
-                let _ = fs::remove_file(&backing_path);
-                return Err(errno_for_fade(error));
-            }
+            self.store.insert_file(&record).map_err(errno_for_fade)?;
+
+            let backing_path = self.backing_path(&path)?;
+            let file = match open_options(flags, true, (mode & !umask) & 0o7777)
+                .open(&backing_path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    let _ = self.store.mark_deleted_by_path(&path);
+                    return Err(errno_for_io(error));
+                }
+            };
 
             let attr = self.visible_attr(&path)?;
             let fh = self.open_handle(file, path);
@@ -665,7 +669,14 @@ impl Filesystem for DevFuse {
                 self.visible_file_record(&from)?;
             }
 
-            fs::rename(&from_backing, &to_backing).map_err(errno_for_io)?;
+            let is_directory = kind == FileType::Directory;
+            self.store
+                .begin_rename(&from, &to, is_directory)
+                .map_err(errno_for_fade)?;
+            if let Err(error) = fs::rename(&from_backing, &to_backing) {
+                let _ = self.store.complete_rename(&from);
+                return Err(errno_for_io(error));
+            }
             if kind == FileType::Directory {
                 self.store
                     .rename_prefix(&from, &to, now_unix_seconds())
@@ -675,6 +686,7 @@ impl Filesystem for DevFuse {
                     .rename_path(&from, &to, now_unix_seconds())
                     .map_err(errno_for_fade)?;
             }
+            self.store.complete_rename(&from).map_err(errno_for_fade)?;
             self.rename_inode_paths(&from, &to);
             Ok(())
         })();
@@ -764,7 +776,11 @@ fn errno_for_fade(error: FadeError) -> i32 {
         FadeError::PathTraversal { .. } => EACCES,
         FadeError::Io(error) => errno_for_io(error),
         FadeError::Sqlite(_) => EIO,
-        FadeError::InvalidState(_) | FadeError::InvalidSize(_) | FadeError::TimeOverflow => EIO,
+        FadeError::InvalidState(_)
+        | FadeError::InvalidSize(_)
+        | FadeError::TimeOverflow
+        | FadeError::UntrackedBackingFile { .. }
+        | FadeError::UnresolvedRename { .. } => EIO,
     }
 }
 

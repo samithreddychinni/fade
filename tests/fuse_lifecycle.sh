@@ -69,3 +69,13 @@ sleep 2
 start_mount
 test "$(cat "$mount_dir/1h/persistent.txt")" = persistent
 test ! -e "$mount_dir/1s/offline.txt"
+stop_mount
+
+printf 'unknown\n' >"$backing_dir/1h/unknown.txt"
+if start_mount >/dev/null 2>&1; then
+    exit 1
+fi
+wait "$mount_pid" || true
+mount_pid=
+rm "$backing_dir/1h/unknown.txt"
+start_mount

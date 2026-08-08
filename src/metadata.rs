@@ -55,6 +55,13 @@ pub struct FileRecord {
     pub size_bytes: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRename {
+    pub from: RelativePath,
+    pub to: RelativePath,
+    pub is_directory: bool,
+}
+
 impl FileRecord {
     pub fn new(
         path: RelativePath,
@@ -292,6 +299,48 @@ impl MetadataStore {
         Ok(())
     }
 
+    pub fn begin_rename(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+        is_directory: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pending_renames (from_path, to_path, is_directory)
+            VALUES (?1, ?2, ?3)",
+            params![from.as_str(), to.as_str(), is_directory],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_renames(&self) -> Result<Vec<PendingRename>> {
+        let mut statement = self.conn.prepare(
+            "SELECT from_path, to_path, is_directory
+            FROM pending_renames
+            ORDER BY from_path",
+        )?;
+        let renames = statement
+            .query_map([], |row| {
+                Ok(PendingRename {
+                    from: RelativePath::new(row.get::<_, String>(0)?)
+                        .map_err(to_sql_conversion_error(0))?,
+                    to: RelativePath::new(row.get::<_, String>(1)?)
+                        .map_err(to_sql_conversion_error(1))?,
+                    is_directory: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(renames)
+    }
+
+    pub fn complete_rename(&self, from: &RelativePath) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pending_renames WHERE from_path = ?1",
+            params![from.as_str()],
+        )?;
+        Ok(())
+    }
+
     pub fn rename_path(&self, from: &RelativePath, to: &RelativePath, modified_at: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE files
@@ -432,6 +481,15 @@ impl MetadataStore {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS pending_renames (
+                from_path TEXT PRIMARY KEY,
+                to_path TEXT NOT NULL UNIQUE,
+                is_directory INTEGER NOT NULL CHECK (is_directory IN (0, 1))
+            );
+
+            INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+            VALUES (2, strftime('%s', 'now'));
             ",
         )?;
         Ok(())

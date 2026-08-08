@@ -229,9 +229,11 @@ Metadata requirements:
 
 - Metadata writes MUST be atomic with respect to visible file creation whenever
   feasible.
-- Startup MUST reconcile metadata with the backing directory.
-- Missing metadata for an existing backing file MUST be handled explicitly:
-  import, quarantine, or fail startup depending on mode.
+- Startup MUST reconcile metadata with the backing directory before mounting.
+- Startup MUST mark a tracked file as deleted when its backing file is missing.
+- Startup MUST finish or cancel a recorded rename from the backing paths.
+- Startup MUST fail when a backing file has no active metadata record.
+- Startup MUST fail when a recorded rename has an ambiguous backing state.
 - Metadata schema changes MUST be versioned.
 
 ### Filesystem operations

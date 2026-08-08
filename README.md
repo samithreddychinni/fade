@@ -10,7 +10,7 @@ that lifetime.
 
 Status: working developer preview. The TTL-folder lifecycle is implemented, but
 Fade is not ready for important or irreplaceable data. The remaining v0.1 work
-is crash behavior and packaging.
+is packaging.
 
 ## Current Implementation
 
@@ -30,6 +30,7 @@ Implemented in the current phase 1 slice:
   lifecycle transitions, record rename/recreate behavior, and reaper deletion.
 - End-to-end FUSE lifecycle coverage for expiry, garbage collection, and
   remount persistence.
+- Startup reconciliation for interrupted create, rename, and delete operations.
 
 Not implemented yet:
 
@@ -129,6 +130,19 @@ Fade has two layers of expiry.
 
 This split gives applications immediate expiry semantics while still allowing a
 short, explicit recovery path for mistakes.
+
+## Startup recovery
+
+Fade checks metadata and backing files before each mount.
+
+- Fade marks a tracked file as deleted when its backing file is missing.
+- Fade completes a recorded rename when the destination exists.
+- Fade cancels a recorded rename when the source still exists.
+- Fade refuses to mount when it finds an untracked backing file.
+- Fade refuses to mount when a recorded rename has an ambiguous disk state.
+
+Fade does not import unknown files. It cannot know their original TTL. Remove
+or move the file before you mount Fade again.
 
 The lifecycle is:
 
@@ -292,7 +306,6 @@ Rust stack:
 ### v0.3: Production Hardening
 
 - Structured audit log.
-- Crash recovery and startup reconciliation.
 - Rename, symlink, hard link, and open-file semantics documented and tested.
 - Packaging for common Linux distributions.
 - Benchmarks against direct filesystem access.
