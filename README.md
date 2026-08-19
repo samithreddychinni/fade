@@ -40,7 +40,34 @@ Not implemented yet:
 - Mountpoint discovery for inspection commands. For now `fade ls`, `fade
   status`, and `fade gc` operate on the Fade backing directory.
 
-## Quickstart From Source
+## Install
+
+Requirements:
+
+- Linux.
+- Rust 1.95 or newer.
+- FUSE runtime support, including `fusermount3` or `fusermount`.
+
+Install Fade for the current user:
+
+```bash
+./install.sh
+```
+
+The script installs `fade` in `~/.local/bin`. Add that directory to `PATH` if
+you need to. To remove Fade, run:
+
+```bash
+./install.sh --uninstall
+```
+
+Use `FADE_PREFIX` to install in another prefix:
+
+```bash
+FADE_PREFIX=/opt/fade ./install.sh
+```
+
+## Build From Source
 
 Requirements:
 
