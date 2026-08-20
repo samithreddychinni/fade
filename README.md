@@ -242,6 +242,19 @@ fade gc ./fade-data
 
 Mountpoint discovery, `fade check`, and `fade recover` are planned.
 
+## Command reference
+
+`fade mount <backing-dir> <mountpoint>` starts a developer-mode mount. Use
+`--recovery-window <duration>` to set the physical deletion delay. Use
+`--reaper-interval <duration>` to set the reaper interval. Durations use `s`,
+`m`, `h`, or `d`. Use `0` for no recovery delay.
+
+`fade ls <backing-dir>` shows tracked files. `fade status <backing-dir>` shows
+counts and the last reaper result. `fade gc <backing-dir>` runs one reaper pass.
+Use `--json` with any inspection command for machine-readable output.
+
+`fade version` prints the installed version.
+
 ## Initial use cases
 
 Fade is intentionally narrow at first:
@@ -272,6 +285,31 @@ backups, snapshots, access controls, audit retention, and organizational policy.
 Fade is not secure erase on every storage device. On SSDs, copy-on-write
 filesystems, journaled filesystems, and snapshotting environments, overwriting
 or deleting a file does not necessarily remove every physical copy.
+
+## Known filesystem limits
+
+Use regular files and directories in a Fade mount. Fade hides symlinks and does
+not support hard links, ownership changes, permission changes, or timestamp
+changes. Do not rely on `mmap`, `fsync`, or path-level truncate behavior.
+
+Data that the kernel or an application already cached can outlive expiry. Fade
+blocks later path lookups and open-handle reads and writes after expiry.
+
+## Troubleshooting
+
+If mounting reports a missing FUSE device, load the `fuse` kernel module. Make
+sure `/dev/fuse` exists and `fusermount3` or `fusermount` is installed.
+
+If startup reports an untracked backing file, move or remove that file from the
+backing directory. Fade refuses to assign a TTL without metadata.
+
+If unmount fails, close programs that use the mount. Then run:
+
+```bash
+fusermount3 -u <mountpoint>
+```
+
+Use `fusermount -u <mountpoint>` when your system provides FUSE 2.
 
 ## Design principles
 
