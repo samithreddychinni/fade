@@ -1,3 +1,5 @@
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
@@ -9,9 +11,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::clock::now_unix_seconds;
 use crate::duration::{format_ttl_seconds, parse_duration};
-use crate::layout::{init_backing_dir, looks_like_backing_dir, metadata_db_path};
-use crate::metadata::{FileRecord, MetadataStore, StoreStats};
-use crate::path::RelativePath;
+use crate::layout::{init_backing_dir, looks_like_backing_dir, metadata_db_path, metadata_dir};
+use crate::metadata::{FileRecord, FileState, MetadataStore, StoreStats};
+use crate::path::{RelativePath, safe_join};
 use crate::policy::{DevPolicy, Policy};
 use crate::reaper;
 
@@ -78,6 +80,18 @@ enum Command {
         json: bool,
     },
 
+    /// Restore an expired file and copy it to a new path.
+    Recover {
+        backing_dir: PathBuf,
+        path: PathBuf,
+
+        #[arg(long)]
+        to: PathBuf,
+
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Print the Fade version.
     Version,
 }
@@ -112,6 +126,12 @@ pub fn run() -> anyhow::Result<()> {
         Command::Status { path, json } => status(&path, json),
         Command::Gc { path, json } => gc(&path, json),
         Command::Check { config, path, json } => check(&config, &path, json),
+        Command::Recover {
+            backing_dir,
+            path,
+            to,
+            json,
+        } => recover(&backing_dir, &path, &to, json),
         Command::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -228,6 +248,108 @@ fn check(config: &Path, path: &Path, json: bool) -> anyhow::Result<()> {
         println!("policy_source: {}", result.policy_source);
         Ok(())
     }
+}
+
+fn recover(backing_dir: &Path, path: &Path, to: &Path, json: bool) -> anyhow::Result<()> {
+    let result = recover_at(backing_dir, path, to, now_unix_seconds())?;
+    if json {
+        print_json(&result)
+    } else {
+        println!("recovered: {}", result.path);
+        println!("copied_to: {}", result.destination.display());
+        Ok(())
+    }
+}
+
+fn recover_at(backing_dir: &Path, path: &Path, to: &Path, now: i64) -> anyhow::Result<RecoverView> {
+    let backing_dir = resolve_backing_dir(backing_dir)?;
+    let path = RelativePath::new(path)?;
+    if path.is_root() {
+        bail!("recovery path must identify a file");
+    }
+
+    let destination_parent = to
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if fs::canonicalize(destination_parent)?.starts_with(fs::canonicalize(&backing_dir)?) {
+        bail!("recovery destination must be outside the Fade backing directory");
+    }
+
+    let store = open_store(&backing_dir)?;
+    store.expire_due(now)?;
+    let record = store
+        .get_by_path(&path)?
+        .ok_or_else(|| anyhow!("`{path}` is not tracked by Fade"))?;
+    if record.state != FileState::Expired {
+        bail!("`{path}` is not expired and recoverable");
+    }
+
+    let source_path = safe_join(&backing_dir, &record.backing_path)?;
+    if !fs::symlink_metadata(&source_path)?.file_type().is_file() {
+        bail!("expired path `{path}` is not a regular file");
+    }
+    let mut source = File::open(&source_path)
+        .with_context(|| format!("failed to open expired file `{path}`"))?;
+
+    // ponytail: the state claim is the GC lock; add an operation journal if crash-atomic exports matter.
+    if !store.claim_recovery(&record.id, now)? {
+        bail!("the recovery window for `{path}` has elapsed");
+    }
+
+    let mut destination = match OpenOptions::new().write(true).create_new(true).open(to) {
+        Ok(destination) => destination,
+        Err(error) => {
+            store.cancel_recovery(&record.id)?;
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                bail!("refusing to overwrite `{}`", to.display());
+            }
+            return Err(error).with_context(|| {
+                format!("failed to create recovery destination `{}`", to.display())
+            });
+        }
+    };
+    let copy_result = (|| -> anyhow::Result<()> {
+        io::copy(&mut source, &mut destination)?;
+        destination.sync_all()?;
+        append_recovery_audit(&backing_dir, &path, to, now)?;
+        Ok(())
+    })();
+
+    if let Err(error) = copy_result {
+        drop(destination);
+        let _ = fs::remove_file(to);
+        store.cancel_recovery(&record.id)?;
+        return Err(error);
+    }
+
+    Ok(RecoverView {
+        path: path.as_str().to_string(),
+        destination: to.to_path_buf(),
+        state: FileState::Recovered.as_str().to_string(),
+    })
+}
+
+fn append_recovery_audit(
+    backing_dir: &Path,
+    path: &RelativePath,
+    destination: &Path,
+    timestamp: i64,
+) -> anyhow::Result<()> {
+    let mut entry = serde_json::to_vec(&RecoveryAudit {
+        timestamp,
+        event: "file_recovered",
+        path: path.as_str(),
+        destination,
+    })?;
+    entry.push(b'\n');
+    let mut audit = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(metadata_dir(backing_dir).join("audit.jsonl"))?;
+    audit.write_all(&entry)?;
+    audit.sync_data()?;
+    Ok(())
 }
 
 fn ls(path: &Path, json: bool) -> anyhow::Result<()> {
@@ -391,6 +513,21 @@ struct CheckView {
     policy_source: String,
 }
 
+#[derive(Debug, Serialize)]
+struct RecoverView {
+    path: String,
+    destination: PathBuf,
+    state: String,
+}
+
+#[derive(Serialize)]
+struct RecoveryAudit<'a> {
+    timestamp: i64,
+    event: &'static str,
+    path: &'a str,
+    destination: &'a Path,
+}
+
 impl From<FileRecord> for FileView {
     fn from(record: FileRecord) -> Self {
         Self {
@@ -472,6 +609,53 @@ mod tests {
         assert_eq!(
             mount_duration(None, "reaper-interval", false, None, default).unwrap(),
             default
+        );
+    }
+
+    #[test]
+    fn recovery_copies_without_overwriting_and_records_the_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let backing = temp.path().join("backing");
+        init_backing_dir(&backing).unwrap();
+        fs::create_dir(backing.join("1s")).unwrap();
+        fs::write(backing.join("1s/report.txt"), b"recover me").unwrap();
+
+        let store = open_store(&backing).unwrap();
+        let path = RelativePath::new("1s/report.txt").unwrap();
+        let record = FileRecord::new(
+            path.clone(),
+            path,
+            crate::duration::Ttl::Duration(Duration::from_secs(1)),
+            "folder:1s".to_string(),
+            100,
+            Duration::from_secs(100),
+            10,
+        )
+        .unwrap();
+        store.insert_file(&record).unwrap();
+        store.expire_due(101).unwrap();
+
+        let occupied = temp.path().join("occupied.txt");
+        fs::write(&occupied, b"keep me").unwrap();
+        assert!(recover_at(&backing, Path::new("1s/report.txt"), &occupied, 101).is_err());
+        assert_eq!(fs::read(&occupied).unwrap(), b"keep me");
+        assert_eq!(
+            store.get_by_path(&record.path).unwrap().unwrap().state,
+            FileState::Expired
+        );
+
+        let destination = temp.path().join("recovered.txt");
+        recover_at(&backing, Path::new("1s/report.txt"), &destination, 101).unwrap();
+        assert_eq!(fs::read(destination).unwrap(), b"recover me");
+        assert_eq!(
+            store.get_by_path(&record.path).unwrap().unwrap().state,
+            FileState::Recovered
+        );
+        assert_eq!(store.stats(101).unwrap().alive_files, 1);
+        assert!(
+            fs::read_to_string(metadata_dir(&backing).join("audit.jsonl"))
+                .unwrap()
+                .contains("\"event\":\"file_recovered\"")
         );
     }
 }

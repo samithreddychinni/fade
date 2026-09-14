@@ -32,10 +32,10 @@ Implemented in the current phase 1 slice:
 - Startup reconciliation for interrupted create, rename, and delete operations.
 - Policy-mode mounts with ordered TOML glob rules.
 - `fade check` policy previews without mounting.
+- Recovery of expired files during the configured recovery window.
 
 Not implemented yet:
 
-- `fade recover`.
 - Mountpoint discovery for inspection commands. For now `fade ls`, `fade
   status`, and `fade gc` operate on the Fade backing directory.
 
@@ -268,6 +268,11 @@ Use `--json` with any inspection command for machine-readable output.
 `fade check --config <file> --path <relative-file>` previews the first matching
 policy rule without mounting or changing metadata. Use `--json` for
 machine-readable output.
+
+`fade recover <backing-dir> <relative-file> --to <output>` restores an expired
+file before its recovery deadline and copies it to a new output path. Fade
+refuses to overwrite an existing output. Successful recoveries are appended to
+`.fade/audit.jsonl`.
 
 `fade version` prints the installed version.
 

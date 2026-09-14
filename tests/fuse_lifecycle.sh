@@ -8,6 +8,7 @@ mount_dir="$test_dir/mount"
 mount_pid=
 mounted=false
 mount_args=()
+recovery_window=0
 
 cleanup() {
     if "$mounted"; then
@@ -23,7 +24,7 @@ trap cleanup EXIT
 start_mount() {
     "$fade_bin" mount "$backing_dir" "$mount_dir" \
         "${mount_args[@]}" \
-        --recovery-window 0 --reaper-interval 1h >"$test_dir/mount.log" 2>&1 &
+        --recovery-window "$recovery_window" --reaper-interval 1h >"$test_dir/mount.log" 2>&1 &
     mount_pid=$!
 
     for _ in {1..50}; do
@@ -87,6 +88,7 @@ backing_dir="$test_dir/policy-backing"
 mount_dir="$test_dir/policy-mount"
 config="$test_dir/fade.toml"
 mount_args=(--mode policy --config "$config")
+recovery_window=1h
 mkdir "$backing_dir" "$mount_dir"
 cat >"$config" <<'EOF'
 [[rules]]
@@ -109,3 +111,7 @@ printf 'policy\n' >"$mount_dir/7d/session.token"
 test "$(cat "$mount_dir/7d/session.token")" = policy
 sleep 2
 test ! -e "$mount_dir/7d/session.token"
+"$fade_bin" recover "$backing_dir" 7d/session.token --to "$test_dir/recovered.token"
+test "$(cat "$test_dir/recovered.token")" = policy
+test "$(cat "$mount_dir/7d/session.token")" = policy
+grep -q '"event":"file_recovered"' "$backing_dir/.fade/audit.jsonl"

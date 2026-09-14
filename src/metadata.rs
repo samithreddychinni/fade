@@ -288,6 +288,30 @@ impl MetadataStore {
         Ok(())
     }
 
+    pub fn claim_recovery(&self, id: &str, now: i64) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE files
+            SET state = 'recovered'
+            WHERE id = ?1
+              AND state = 'expired'
+              AND recovery_deadline IS NOT NULL
+              AND recovery_deadline > ?2",
+            params![id, now],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn cancel_recovery(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files
+            SET state = 'expired'
+            WHERE id = ?1
+              AND state = 'recovered'",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_deleted_by_path(&self, path: &RelativePath) -> Result<()> {
         self.conn.execute(
             "UPDATE files
@@ -394,7 +418,7 @@ impl MetadataStore {
     }
 
     pub fn stats(&self, now: i64) -> Result<StoreStats> {
-        let alive_files = self.count("state = 'alive'", [])?;
+        let alive_files = self.count("state IN ('alive', 'recovered')", [])?;
         let expired_recoverable_files = self.count(
             "state = 'expired' AND recovery_deadline IS NOT NULL AND recovery_deadline > ?1",
             params![now],
@@ -653,6 +677,20 @@ mod tests {
         let loaded = store.get_by_path(&first.path).unwrap().unwrap();
         assert_eq!(loaded.id, second.id);
         assert_eq!(loaded.state, FileState::Alive);
+    }
+
+    #[test]
+    fn claims_recovery_only_before_the_deadline() {
+        let temp = tempdir().unwrap();
+        let store = MetadataStore::open(temp.path().join("metadata.sqlite")).unwrap();
+        let record = sample_record("1s/report.json", 10, Duration::from_secs(1));
+        store.insert_file(&record).unwrap();
+        store.expire_due(101).unwrap();
+
+        assert!(store.claim_recovery(&record.id, 3_700).unwrap());
+        assert!(store.gc_candidates(3_701, 1).unwrap().is_empty());
+        store.cancel_recovery(&record.id).unwrap();
+        assert!(!store.claim_recovery(&record.id, 3_701).unwrap());
     }
 
     #[test]
