@@ -7,6 +7,7 @@ backing_dir="$test_dir/backing"
 mount_dir="$test_dir/mount"
 mount_pid=
 mounted=false
+mount_args=()
 
 cleanup() {
     if "$mounted"; then
@@ -21,6 +22,7 @@ trap cleanup EXIT
 
 start_mount() {
     "$fade_bin" mount "$backing_dir" "$mount_dir" \
+        "${mount_args[@]}" \
         --recovery-window 0 --reaper-interval 1h >"$test_dir/mount.log" 2>&1 &
     mount_pid=$!
 
@@ -79,3 +81,31 @@ wait "$mount_pid" || true
 mount_pid=
 rm "$backing_dir/1h/unknown.txt"
 start_mount
+stop_mount
+
+backing_dir="$test_dir/policy-backing"
+mount_dir="$test_dir/policy-mount"
+config="$test_dir/fade.toml"
+mount_args=(--mode policy --config "$config")
+mkdir "$backing_dir" "$mount_dir"
+cat >"$config" <<'EOF'
+[[rules]]
+pattern = "*.token"
+ttl = "1s"
+
+[[rules]]
+pattern = "*"
+ttl = "forever"
+EOF
+"$fade_bin" check --config "$config" --path reports/session.token --json \
+    | grep -q '"ttl": "1s"'
+start_mount
+mkdir "$mount_dir/7d"
+printf 'kept\n' >"$mount_dir/7d/kept.txt"
+stop_mount
+start_mount
+test "$(cat "$mount_dir/7d/kept.txt")" = kept
+printf 'policy\n' >"$mount_dir/7d/session.token"
+test "$(cat "$mount_dir/7d/session.token")" = policy
+sleep 2
+test ! -e "$mount_dir/7d/session.token"

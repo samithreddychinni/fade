@@ -14,6 +14,9 @@ pub enum FadeError {
     #[error("no TTL policy applies to `{path}`")]
     MissingTtl { path: String },
 
+    #[error("invalid policy: {0}")]
+    InvalidPolicy(String),
+
     #[error("time calculation overflowed")]
     TimeOverflow,
 

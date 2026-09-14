@@ -21,25 +21,27 @@ use libc::{
 use tracing::{debug, error};
 
 use crate::clock::now_unix_seconds;
-use crate::duration::Ttl;
 use crate::layout::{FADE_DIR, init_backing_dir, metadata_db_path};
 use crate::metadata::{FileRecord, FileState, MetadataStore};
 use crate::path::{RelativePath, safe_join};
-use crate::policy::DevPolicy;
+use crate::policy::Policy;
 use crate::{FadeError, Result};
 
 const ROOT_INO: u64 = 1;
 const ATTR_TTL: Duration = Duration::from_secs(1);
 const DEFAULT_TTL_FOLDERS: &[&str] = &["1m", "1h", "24h", "7d", "30d", "forever"];
 
-pub fn mount_dev(
+pub fn mount(
     backing_dir: &Path,
     mountpoint: &Path,
+    policy: Policy,
     recovery_window: Duration,
     reaper_interval: Duration,
 ) -> anyhow::Result<()> {
     init_backing_dir(backing_dir)?;
-    ensure_default_ttl_folders(backing_dir)?;
+    if policy.is_dev() {
+        ensure_default_ttl_folders(backing_dir)?;
+    }
 
     let db_path = metadata_db_path(backing_dir);
     let store = MetadataStore::open(&db_path)?;
@@ -47,7 +49,7 @@ pub fn mount_dev(
     store.expire_due(now_unix_seconds())?;
 
     let reaper = ReaperThread::spawn(backing_dir.to_path_buf(), db_path, reaper_interval);
-    let filesystem = DevFuse::new(backing_dir.to_path_buf(), store, recovery_window);
+    let filesystem = DevFuse::new(backing_dir.to_path_buf(), store, policy, recovery_window);
     let options = [
         MountOption::FSName("fade".to_string()),
         MountOption::Subtype("fade".to_string()),
@@ -133,7 +135,7 @@ struct OpenHandle {
 struct DevFuse {
     backing_dir: PathBuf,
     store: MetadataStore,
-    policy: DevPolicy,
+    policy: Policy,
     recovery_window: Duration,
     next_ino: u64,
     next_fh: u64,
@@ -143,7 +145,12 @@ struct DevFuse {
 }
 
 impl DevFuse {
-    fn new(backing_dir: PathBuf, store: MetadataStore, recovery_window: Duration) -> Self {
+    fn new(
+        backing_dir: PathBuf,
+        store: MetadataStore,
+        policy: Policy,
+        recovery_window: Duration,
+    ) -> Self {
         let mut paths_by_ino = HashMap::new();
         let mut inos_by_path = HashMap::new();
         paths_by_ino.insert(ROOT_INO, RelativePath::root());
@@ -152,7 +159,7 @@ impl DevFuse {
         Self {
             backing_dir,
             store,
-            policy: DevPolicy,
+            policy,
             recovery_window,
             next_ino: ROOT_INO + 1,
             next_fh: 1,
@@ -270,9 +277,7 @@ impl DevFuse {
             return true;
         }
 
-        path.components()
-            .next()
-            .is_some_and(|first| Ttl::parse(first).is_ok())
+        self.policy.directory_visible(path)
     }
 
     fn parent_directory_visible(&self, path: &RelativePath) -> bool {
@@ -331,7 +336,7 @@ impl Filesystem for DevFuse {
             let path = self.child_path(parent, name)?;
             if path.parent().is_some_and(|parent| parent.is_root()) {
                 self.policy
-                    .validate_root_policy_folder(path.file_name().unwrap_or_default())
+                    .validate_root_directory(path.file_name().unwrap_or_default())
                     .map_err(errno_for_fade)?;
             } else if !self.parent_directory_visible(&path) {
                 return Err(EINVAL);
@@ -771,7 +776,9 @@ fn unix_time(seconds: i64, nanos: i64) -> SystemTime {
 fn errno_for_fade(error: FadeError) -> i32 {
     debug!(%error, "Fade operation failed");
     match error {
-        FadeError::InvalidDuration { .. } | FadeError::InvalidPath { .. } => EINVAL,
+        FadeError::InvalidDuration { .. }
+        | FadeError::InvalidPath { .. }
+        | FadeError::InvalidPolicy(_) => EINVAL,
         FadeError::MissingTtl { .. } => EINVAL,
         FadeError::PathTraversal { .. } => EACCES,
         FadeError::Io(error) => errno_for_io(error),

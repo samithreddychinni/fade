@@ -11,6 +11,8 @@ use crate::clock::now_unix_seconds;
 use crate::duration::{format_ttl_seconds, parse_duration};
 use crate::layout::{init_backing_dir, looks_like_backing_dir, metadata_db_path};
 use crate::metadata::{FileRecord, MetadataStore, StoreStats};
+use crate::path::RelativePath;
+use crate::policy::{DevPolicy, Policy};
 use crate::reaper;
 
 #[derive(Debug, Parser)]
@@ -30,11 +32,14 @@ enum Command {
         #[arg(long, value_enum, default_value_t = MountMode::Dev)]
         mode: MountMode,
 
-        #[arg(long, default_value = "1h")]
-        recovery_window: String,
+        #[arg(long)]
+        config: Option<PathBuf>,
 
-        #[arg(long, default_value = "60s")]
-        reaper_interval: String,
+        #[arg(long)]
+        recovery_window: Option<String>,
+
+        #[arg(long)]
+        reaper_interval: Option<String>,
     },
 
     /// List files tracked by Fade metadata.
@@ -61,6 +66,18 @@ enum Command {
         json: bool,
     },
 
+    /// Preview the policy assignment for a path without mounting.
+    Check {
+        #[arg(long)]
+        config: PathBuf,
+
+        #[arg(long)]
+        path: PathBuf,
+
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Print the Fade version.
     Version,
 }
@@ -80,18 +97,21 @@ pub fn run() -> anyhow::Result<()> {
             backing_dir,
             mountpoint,
             mode,
+            config,
             recovery_window,
             reaper_interval,
         } => mount(
             &backing_dir,
             &mountpoint,
             mode,
-            &recovery_window,
-            &reaper_interval,
+            config.as_deref(),
+            recovery_window.as_deref(),
+            reaper_interval.as_deref(),
         ),
         Command::Ls { path, json } => ls(&path, json),
         Command::Status { path, json } => status(&path, json),
         Command::Gc { path, json } => gc(&path, json),
+        Command::Check { config, path, json } => check(&config, &path, json),
         Command::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -111,17 +131,38 @@ fn mount(
     backing_dir: &Path,
     mountpoint: &Path,
     mode: MountMode,
-    recovery_window: &str,
-    reaper_interval: &str,
+    config: Option<&Path>,
+    recovery_window: Option<&str>,
+    reaper_interval: Option<&str>,
 ) -> anyhow::Result<()> {
-    if mode != MountMode::Dev {
-        bail!("policy mode is planned for v0.2; phase 1 only supports developer mode");
-    }
+    let policy = match mode {
+        MountMode::Dev => {
+            if config.is_some() {
+                bail!("--config requires --mode policy");
+            }
+            Policy::Dev(DevPolicy)
+        }
+        MountMode::Policy => {
+            let config = config.ok_or_else(|| anyhow!("--mode policy requires --config <file>"))?;
+            Policy::from_config(config)
+                .with_context(|| format!("failed to load policy `{}`", config.display()))?
+        }
+    };
 
-    let recovery_window = parse_duration(recovery_window, true)
-        .with_context(|| format!("invalid --recovery-window `{recovery_window}`"))?;
-    let reaper_interval = parse_duration(reaper_interval, false)
-        .with_context(|| format!("invalid --reaper-interval `{reaper_interval}`"))?;
+    let recovery_window = mount_duration(
+        recovery_window,
+        "recovery-window",
+        true,
+        policy.recovery_window(),
+        std::time::Duration::from_secs(3_600),
+    )?;
+    let reaper_interval = mount_duration(
+        reaper_interval,
+        "reaper-interval",
+        false,
+        policy.reaper_interval(),
+        std::time::Duration::from_secs(60),
+    )?;
 
     init_backing_dir(backing_dir)
         .with_context(|| format!("failed to initialize `{}`", backing_dir.display()))?;
@@ -130,16 +171,62 @@ fn mount(
 
     #[cfg(feature = "fuse")]
     {
-        return crate::fuse_fs::mount_dev(backing_dir, mountpoint, recovery_window, reaper_interval)
-            .with_context(|| format!("failed to mount `{}`", mountpoint.display()));
+        return crate::fuse_fs::mount(
+            backing_dir,
+            mountpoint,
+            policy,
+            recovery_window,
+            reaper_interval,
+        )
+        .with_context(|| format!("failed to mount `{}`", mountpoint.display()));
     }
 
     #[cfg(not(feature = "fuse"))]
     {
         let _ = mountpoint;
+        let _ = policy;
         let _ = recovery_window;
         let _ = reaper_interval;
         bail!("this binary was built without FUSE support")
+    }
+}
+
+fn mount_duration(
+    flag: Option<&str>,
+    name: &str,
+    allow_zero: bool,
+    config: Option<std::time::Duration>,
+    default: std::time::Duration,
+) -> anyhow::Result<std::time::Duration> {
+    flag.map(|value| {
+        parse_duration(value, allow_zero).with_context(|| format!("invalid --{name} `{value}`"))
+    })
+    .transpose()
+    .map(|value| value.or(config).unwrap_or(default))
+}
+
+fn check(config: &Path, path: &Path, json: bool) -> anyhow::Result<()> {
+    let path = RelativePath::new(path)?;
+    if path.is_root() {
+        bail!("--path must identify a file");
+    }
+    let assignment = Policy::from_config(config)
+        .with_context(|| format!("failed to load policy `{}`", config.display()))?
+        .assign_file(&path)?;
+    let result = CheckView {
+        path: path.as_str().to_string(),
+        ttl: assignment.ttl.label(),
+        ttl_seconds: assignment.ttl.ttl_seconds(),
+        policy_source: assignment.source.as_label(),
+    };
+
+    if json {
+        print_json(&result)
+    } else {
+        println!("path: {}", result.path);
+        println!("ttl: {}", result.ttl);
+        println!("policy_source: {}", result.policy_source);
+        Ok(())
     }
 }
 
@@ -163,22 +250,26 @@ fn status(path: &Path, json: bool) -> anyhow::Result<()> {
     let store = open_store(&backing_dir)?;
     let now = now_unix_seconds();
     store.expire_due(now)?;
-    let stats = StatusView::new(backing_dir, store.db_path().to_path_buf(), store.stats(now)?);
+    let stats = StatusView::new(
+        backing_dir,
+        store.db_path().to_path_buf(),
+        store.stats(now)?,
+    );
 
     if json {
         print_json(&stats)
     } else {
         println!("alive_files: {}", stats.alive_files);
-        println!("expired_recoverable_files: {}", stats.expired_recoverable_files);
+        println!(
+            "expired_recoverable_files: {}",
+            stats.expired_recoverable_files
+        );
         println!("pending_deletion_files: {}", stats.pending_deletion_files);
         println!("pending_deletion_bytes: {}", stats.pending_deletion_bytes);
         println!("deleted_files: {}", stats.deleted_files);
         println!(
             "last_reaper_run_at: {}",
-            stats
-                .last_reaper_run_at
-                .as_deref()
-                .unwrap_or("never")
+            stats.last_reaper_run_at.as_deref().unwrap_or("never")
         );
         println!(
             "last_reaper_duration_ms: {}",
@@ -189,13 +280,13 @@ fn status(path: &Path, json: bool) -> anyhow::Result<()> {
         );
         println!(
             "last_reaper_error: {}",
-            stats
-                .last_reaper_error
-                .as_deref()
-                .unwrap_or("none")
+            stats.last_reaper_error.as_deref().unwrap_or("none")
         );
         println!("metadata_db_path: {}", stats.metadata_db_path.display());
-        println!("backing_directory_path: {}", stats.backing_directory_path.display());
+        println!(
+            "backing_directory_path: {}",
+            stats.backing_directory_path.display()
+        );
         Ok(())
     }
 }
@@ -218,8 +309,12 @@ fn gc(path: &Path, json: bool) -> anyhow::Result<()> {
 }
 
 fn open_store(backing_dir: &Path) -> anyhow::Result<MetadataStore> {
-    MetadataStore::open(metadata_db_path(backing_dir))
-        .with_context(|| format!("failed to open Fade metadata under `{}`", backing_dir.display()))
+    MetadataStore::open(metadata_db_path(backing_dir)).with_context(|| {
+        format!(
+            "failed to open Fade metadata under `{}`",
+            backing_dir.display()
+        )
+    })
 }
 
 fn resolve_backing_dir(path: &Path) -> anyhow::Result<PathBuf> {
@@ -288,6 +383,14 @@ struct FileView {
     size_bytes: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct CheckView {
+    path: String,
+    ttl: String,
+    ttl_seconds: Option<i64>,
+    policy_source: String,
+}
+
 impl From<FileRecord> for FileView {
     fn from(record: FileRecord) -> Self {
         Self {
@@ -338,5 +441,37 @@ impl StatusView {
             config_path: None,
             config_hash: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn mount_flags_override_config_and_defaults() {
+        let configured = Duration::from_secs(30);
+        let default = Duration::from_secs(60);
+
+        assert_eq!(
+            mount_duration(
+                Some("1s"),
+                "reaper-interval",
+                false,
+                Some(configured),
+                default
+            )
+            .unwrap(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            mount_duration(None, "reaper-interval", false, Some(configured), default).unwrap(),
+            configured
+        );
+        assert_eq!(
+            mount_duration(None, "reaper-interval", false, None, default).unwrap(),
+            default
+        );
     }
 }

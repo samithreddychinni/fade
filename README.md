@@ -8,9 +8,8 @@ human remembers to remove it. Fade moves that cleanup decision closer to the
 storage boundary: files receive a time-to-live, and the filesystem enforces
 that lifetime.
 
-Status: working developer preview. The TTL-folder lifecycle is implemented, but
-Fade is not ready for important or irreplaceable data. The remaining v0.1 work
-is packaging.
+Status: v0.1.0 is a developer preview. Policy mode now supports ordered TOML
+rules. Do not use Fade for important or irreplaceable data.
 
 ## Current Implementation
 
@@ -31,11 +30,11 @@ Implemented in the current phase 1 slice:
 - End-to-end FUSE lifecycle coverage for expiry, garbage collection, and
   remount persistence.
 - Startup reconciliation for interrupted create, rename, and delete operations.
+- Policy-mode mounts with ordered TOML glob rules.
+- `fade check` policy previews without mounting.
 
 Not implemented yet:
 
-- Policy mode and TOML rule matching.
-- `fade check` dry run.
 - `fade recover`.
 - Mountpoint discovery for inspection commands. For now `fade ls`, `fade
   status`, and `fade gc` operate on the Fade backing directory.
@@ -197,7 +196,7 @@ cp notes.txt ./mnt/forever/
 Files created under `24h/` live for 24 hours. Files created under `7d/` live for
 7 days. No application code needs to pass flags or call a Fade API.
 
-### Planned policy mode
+### Policy mode
 
 Policy mode uses a config file. It is intended for services and shared
 environments where expiry should be controlled centrally.
@@ -225,9 +224,21 @@ recovery_window = "1h"
 ```
 
 Fade evaluates rules in order and assigns the first matching TTL when a file is
-created. In policy mode, config wins over folder hints. The catch-all rule is
-intentional: production mounts should not silently create files with unknown
-retention.
+created. The final rule must be `*`, so every file receives a TTL. Reaper
+settings in the config override the built-in defaults; mount flags override the
+config.
+
+Start a policy-mode mount with:
+
+```bash
+fade mount ./fade-data ./mnt --mode policy --config fade.toml
+```
+
+Preview a rule assignment without mounting:
+
+```bash
+fade check --config fade.toml --path reports/session.token
+```
 
 ### Inspection
 
@@ -240,18 +251,23 @@ fade status ./fade-data
 fade gc ./fade-data
 ```
 
-Mountpoint discovery, `fade check`, and `fade recover` are planned.
+Mountpoint discovery and `fade recover` are planned.
 
 ## Command reference
 
 `fade mount <backing-dir> <mountpoint>` starts a developer-mode mount. Use
-`--recovery-window <duration>` to set the physical deletion delay. Use
-`--reaper-interval <duration>` to set the reaper interval. Durations use `s`,
-`m`, `h`, or `d`. Use `0` for no recovery delay.
+`--mode policy --config <file>` for TOML rules. Use `--recovery-window
+<duration>` to set the physical deletion delay. Use `--reaper-interval
+<duration>` to set the reaper interval. Durations use `s`, `m`, `h`, or `d`.
+Use `0` for no recovery delay.
 
 `fade ls <backing-dir>` shows tracked files. `fade status <backing-dir>` shows
 counts and the last reaper result. `fade gc <backing-dir>` runs one reaper pass.
 Use `--json` with any inspection command for machine-readable output.
+
+`fade check --config <file> --path <relative-file>` previews the first matching
+policy rule without mounting or changing metadata. Use `--json` for
+machine-readable output.
 
 `fade version` prints the installed version.
 
