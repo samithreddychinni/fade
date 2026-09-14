@@ -64,6 +64,9 @@ test ! -e "$mount_dir/1s/ephemeral.txt"
 test -f "$backing_dir/1s/ephemeral.txt"
 "$fade_bin" gc "$backing_dir" --json >/dev/null
 test ! -e "$backing_dir/1s/ephemeral.txt"
+grep -q '"event":"file_created"' "$backing_dir/.fade/audit.jsonl"
+grep -q '"event":"file_expired"' "$backing_dir/.fade/audit.jsonl"
+grep -q '"event":"file_deleted"' "$backing_dir/.fade/audit.jsonl"
 
 printf 'persistent\n' >"$mount_dir/1h/persistent.txt"
 printf 'offline expiry\n' >"$mount_dir/1s/offline.txt"
@@ -113,5 +116,5 @@ sleep 2
 test ! -e "$mount_dir/7d/session.token"
 "$fade_bin" recover "$backing_dir" 7d/session.token --to "$test_dir/recovered.token"
 test "$(cat "$test_dir/recovered.token")" = policy
-test "$(cat "$mount_dir/7d/session.token")" = policy
+test ! -e "$mount_dir/7d/session.token"
 grep -q '"event":"file_recovered"' "$backing_dir/.fade/audit.jsonl"

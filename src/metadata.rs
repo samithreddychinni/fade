@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::audit;
 use crate::duration::Ttl;
 use crate::path::RelativePath;
 use crate::{FadeError, Result};
@@ -240,15 +241,36 @@ impl MetadataStore {
     }
 
     pub fn expire_due(&self, now: i64) -> Result<u64> {
-        let changed = self.conn.execute(
+        let mut statement = self.conn.prepare(
             "UPDATE files
             SET state = 'expired'
             WHERE state = 'alive'
               AND expires_at IS NOT NULL
-              AND expires_at <= ?1",
-            params![now],
+              AND expires_at <= ?1
+            RETURNING path, policy_source",
         )?;
-        Ok(changed as u64)
+        let expired = statement
+            .query_map(params![now], |row| {
+                let path = RelativePath::new(row.get::<_, String>(0)?)
+                    .map_err(to_sql_conversion_error(0))?;
+                Ok((path, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        if let Some(backing_dir) = self.audit_backing_dir() {
+            for (path, policy_source) in &expired {
+                audit::append(
+                    backing_dir,
+                    now,
+                    "file_expired",
+                    path,
+                    Some(policy_source),
+                    None,
+                )?;
+            }
+        }
+        Ok(expired.len() as u64)
     }
 
     pub fn gc_candidates(&self, now: i64, limit: u64) -> Result<Vec<FileRecord>> {
@@ -288,28 +310,20 @@ impl MetadataStore {
         Ok(())
     }
 
-    pub fn claim_recovery(&self, id: &str, now: i64) -> Result<bool> {
-        let changed = self.conn.execute(
-            "UPDATE files
-            SET state = 'recovered'
+    pub fn is_recoverable(&self, id: &str, now: i64) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM files
             WHERE id = ?1
               AND state = 'expired'
               AND recovery_deadline IS NOT NULL
-              AND recovery_deadline > ?2",
-            params![id, now],
-        )?;
-        Ok(changed == 1)
-    }
-
-    pub fn cancel_recovery(&self, id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE files
-            SET state = 'expired'
-            WHERE id = ?1
-              AND state = 'recovered'",
-            params![id],
-        )?;
-        Ok(())
+              AND recovery_deadline > ?2
+                )",
+                params![id, now],
+                |row| row.get(0),
+            )
+            .map_err(FadeError::from)
     }
 
     pub fn mark_deleted_by_path(&self, path: &RelativePath) -> Result<()> {
@@ -418,7 +432,7 @@ impl MetadataStore {
     }
 
     pub fn stats(&self, now: i64) -> Result<StoreStats> {
-        let alive_files = self.count("state IN ('alive', 'recovered')", [])?;
+        let alive_files = self.count("state = 'alive'", [])?;
         let expired_recoverable_files = self.count(
             "state = 'expired' AND recovery_deadline IS NOT NULL AND recovery_deadline > ?1",
             params![now],
@@ -575,6 +589,13 @@ impl MetadataStore {
             .execute("DELETE FROM runtime_state WHERE key = ?1", params![key])?;
         Ok(())
     }
+
+    fn audit_backing_dir(&self) -> Option<&Path> {
+        let metadata_dir = self.db_path.parent()?;
+        (metadata_dir.file_name()?.to_str()? == ".fade")
+            .then(|| metadata_dir.parent())
+            .flatten()
+    }
 }
 
 fn read_record(row: &Row<'_>) -> rusqlite::Result<FileRecord> {
@@ -680,17 +701,15 @@ mod tests {
     }
 
     #[test]
-    fn claims_recovery_only_before_the_deadline() {
+    fn allows_recovery_only_before_the_deadline() {
         let temp = tempdir().unwrap();
         let store = MetadataStore::open(temp.path().join("metadata.sqlite")).unwrap();
         let record = sample_record("1s/report.json", 10, Duration::from_secs(1));
         store.insert_file(&record).unwrap();
         store.expire_due(101).unwrap();
 
-        assert!(store.claim_recovery(&record.id, 3_700).unwrap());
-        assert!(store.gc_candidates(3_701, 1).unwrap().is_empty());
-        store.cancel_recovery(&record.id).unwrap();
-        assert!(!store.claim_recovery(&record.id, 3_701).unwrap());
+        assert!(store.is_recoverable(&record.id, 3_700).unwrap());
+        assert!(!store.is_recoverable(&record.id, 3_701).unwrap());
     }
 
     #[test]

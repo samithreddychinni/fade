@@ -20,6 +20,7 @@ use libc::{
 };
 use tracing::{debug, error};
 
+use crate::audit;
 use crate::clock::now_unix_seconds;
 use crate::layout::{FADE_DIR, init_backing_dir, metadata_db_path};
 use crate::metadata::{FileRecord, FileState, MetadataStore};
@@ -397,7 +398,28 @@ impl Filesystem for DevFuse {
                 }
             };
 
-            let attr = self.visible_attr(&path)?;
+            let attr = match self.visible_attr(&path) {
+                Ok(attr) => attr,
+                Err(error) => {
+                    drop(file);
+                    let _ = fs::remove_file(&backing_path);
+                    let _ = self.store.mark_deleted_by_path(&path);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = audit::append(
+                &self.backing_dir,
+                record.created_at,
+                "file_created",
+                &path,
+                Some(&record.policy_source),
+                None,
+            ) {
+                drop(file);
+                let _ = fs::remove_file(&backing_path);
+                let _ = self.store.mark_deleted_by_path(&path);
+                return Err(errno_for_fade(error));
+            }
             let fh = self.open_handle(file, path);
             Ok((attr, fh))
         })();
@@ -602,12 +624,21 @@ impl Filesystem for DevFuse {
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let result = (|| {
             let path = self.child_path(parent, name)?;
-            self.visible_file_record(&path)?;
+            let record = self.visible_file_record(&path)?;
             let backing_path = self.backing_path(&path)?;
             fs::remove_file(backing_path).map_err(errno_for_io)?;
             self.store
                 .mark_deleted_by_path(&path)
                 .map_err(errno_for_fade)?;
+            audit::append(
+                &self.backing_dir,
+                now_unix_seconds(),
+                "file_deleted",
+                &path,
+                Some(&record.policy_source),
+                None,
+            )
+            .map_err(errno_for_fade)?;
             self.remove_inode_for_path(&path);
             Ok(())
         })();

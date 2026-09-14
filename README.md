@@ -33,6 +33,7 @@ Implemented in the current phase 1 slice:
 - Policy-mode mounts with ordered TOML glob rules.
 - `fade check` policy previews without mounting.
 - Recovery of expired files during the configured recovery window.
+- JSON Lines audit events for file creation, expiry, recovery, and deletion.
 
 Not implemented yet:
 
@@ -251,7 +252,7 @@ fade status ./fade-data
 fade gc ./fade-data
 ```
 
-Mountpoint discovery and `fade recover` are planned.
+Mountpoint discovery is planned.
 
 ## Command reference
 
@@ -269,9 +270,9 @@ Use `--json` with any inspection command for machine-readable output.
 policy rule without mounting or changing metadata. Use `--json` for
 machine-readable output.
 
-`fade recover <backing-dir> <relative-file> --to <output>` restores an expired
-file before its recovery deadline and copies it to a new output path. Fade
-refuses to overwrite an existing output. Successful recoveries are appended to
+`fade recover <backing-dir> <relative-file> --to <output>` exports an expired
+file before its recovery deadline. The original remains expired and Fade refuses
+to overwrite an existing output. Successful recoveries are appended to
 `.fade/audit.jsonl`.
 
 `fade version` prints the installed version.
@@ -354,7 +355,7 @@ High-level components:
 
 - FUSE mount: path resolution, reads, writes, stats, renames, and directory
   listing behavior.
-- Policy engine: TTL folder parsing, with config-rule matching planned.
+- Policy engine: TTL folder parsing and ordered config-rule matching.
 - Metadata store: SQLite records for path, TTL, creation time, expiry time,
   recovery deadline, state, and backing object location.
 - Reaper: periodic and manually triggered physical cleanup.

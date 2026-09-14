@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
+use crate::audit;
 use crate::metadata::{FileState, MetadataStore};
 use crate::path::{RelativePath, safe_join};
 use crate::{FadeError, Result};
@@ -130,6 +131,14 @@ pub fn run_once(store: &MetadataStore, backing_dir: &Path, now: i64) -> Result<R
         }
 
         store.mark_deleted(&record.id)?;
+        audit::append(
+            backing_dir,
+            now,
+            "file_deleted",
+            &record.path,
+            Some(&record.policy_source),
+            None,
+        )?;
     }
 
     let report = ReaperReport {

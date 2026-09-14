@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod cli;
 pub mod clock;
 pub mod duration;

@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
@@ -8,10 +9,12 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
+use crate::audit;
 use crate::clock::now_unix_seconds;
 use crate::duration::{format_ttl_seconds, parse_duration};
-use crate::layout::{init_backing_dir, looks_like_backing_dir, metadata_db_path, metadata_dir};
+use crate::layout::{init_backing_dir, looks_like_backing_dir, metadata_db_path};
 use crate::metadata::{FileRecord, FileState, MetadataStore, StoreStats};
 use crate::path::{RelativePath, safe_join};
 use crate::policy::{DevPolicy, Policy};
@@ -80,7 +83,7 @@ enum Command {
         json: bool,
     },
 
-    /// Restore an expired file and copy it to a new path.
+    /// Export an expired file to a new path.
     Recover {
         backing_dir: PathBuf,
         path: PathBuf,
@@ -255,7 +258,7 @@ fn recover(backing_dir: &Path, path: &Path, to: &Path, json: bool) -> anyhow::Re
     if json {
         print_json(&result)
     } else {
-        println!("recovered: {}", result.path);
+        println!("exported: {}", result.path);
         println!("copied_to: {}", result.destination.display());
         Ok(())
     }
@@ -292,64 +295,52 @@ fn recover_at(backing_dir: &Path, path: &Path, to: &Path, now: i64) -> anyhow::R
     let mut source = File::open(&source_path)
         .with_context(|| format!("failed to open expired file `{path}`"))?;
 
-    // ponytail: the state claim is the GC lock; add an operation journal if crash-atomic exports matter.
-    if !store.claim_recovery(&record.id, now)? {
+    let opened_metadata = source.metadata()?;
+    let source_metadata = fs::symlink_metadata(&source_path)?;
+    if !source_metadata.file_type().is_file()
+        || source_metadata.dev() != opened_metadata.dev()
+        || source_metadata.ino() != opened_metadata.ino()
+    {
+        bail!("expired path `{path}` changed while it was opened");
+    }
+    if !store.is_recoverable(&record.id, now)? {
         bail!("the recovery window for `{path}` has elapsed");
     }
 
-    let mut destination = match OpenOptions::new().write(true).create_new(true).open(to) {
-        Ok(destination) => destination,
-        Err(error) => {
-            store.cancel_recovery(&record.id)?;
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                bail!("refusing to overwrite `{}`", to.display());
-            }
-            return Err(error).with_context(|| {
-                format!("failed to create recovery destination `{}`", to.display())
-            });
-        }
-    };
+    let temporary_path = destination_parent.join(format!(".fade-recover-{}", Uuid::new_v4()));
+    let mut destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary_path)?;
     let copy_result = (|| -> anyhow::Result<()> {
         io::copy(&mut source, &mut destination)?;
         destination.sync_all()?;
-        append_recovery_audit(&backing_dir, &path, to, now)?;
+        fs::hard_link(&temporary_path, to).with_context(|| {
+            if to.exists() {
+                format!("refusing to overwrite `{}`", to.display())
+            } else {
+                format!("failed to publish recovery destination `{}`", to.display())
+            }
+        })?;
+        audit::append(
+            &backing_dir,
+            now,
+            "file_recovered",
+            &path,
+            Some(&record.policy_source),
+            Some(to),
+        )?;
         Ok(())
     })();
 
-    if let Err(error) = copy_result {
-        drop(destination);
-        let _ = fs::remove_file(to);
-        store.cancel_recovery(&record.id)?;
-        return Err(error);
-    }
+    drop(destination);
+    let _ = fs::remove_file(temporary_path);
+    copy_result?;
 
     Ok(RecoverView {
         path: path.as_str().to_string(),
         destination: to.to_path_buf(),
-        state: FileState::Recovered.as_str().to_string(),
     })
-}
-
-fn append_recovery_audit(
-    backing_dir: &Path,
-    path: &RelativePath,
-    destination: &Path,
-    timestamp: i64,
-) -> anyhow::Result<()> {
-    let mut entry = serde_json::to_vec(&RecoveryAudit {
-        timestamp,
-        event: "file_recovered",
-        path: path.as_str(),
-        destination,
-    })?;
-    entry.push(b'\n');
-    let mut audit = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(metadata_dir(backing_dir).join("audit.jsonl"))?;
-    audit.write_all(&entry)?;
-    audit.sync_data()?;
-    Ok(())
 }
 
 fn ls(path: &Path, json: bool) -> anyhow::Result<()> {
@@ -517,15 +508,6 @@ struct CheckView {
 struct RecoverView {
     path: String,
     destination: PathBuf,
-    state: String,
-}
-
-#[derive(Serialize)]
-struct RecoveryAudit<'a> {
-    timestamp: i64,
-    event: &'static str,
-    path: &'a str,
-    destination: &'a Path,
 }
 
 impl From<FileRecord> for FileView {
@@ -613,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_copies_without_overwriting_and_records_the_event() {
+    fn recovery_exports_without_overwriting_or_restoring_the_source() {
         let temp = tempfile::tempdir().unwrap();
         let backing = temp.path().join("backing");
         init_backing_dir(&backing).unwrap();
@@ -649,13 +631,72 @@ mod tests {
         assert_eq!(fs::read(destination).unwrap(), b"recover me");
         assert_eq!(
             store.get_by_path(&record.path).unwrap().unwrap().state,
-            FileState::Recovered
+            FileState::Expired
         );
-        assert_eq!(store.stats(101).unwrap().alive_files, 1);
+        assert_eq!(store.stats(101).unwrap().alive_files, 0);
         assert!(
-            fs::read_to_string(metadata_dir(&backing).join("audit.jsonl"))
+            fs::read_to_string(crate::layout::metadata_dir(&backing).join("audit.jsonl"))
                 .unwrap()
                 .contains("\"event\":\"file_recovered\"")
         );
+
+        let secret = temp.path().join("secret.txt");
+        fs::write(&secret, b"outside").unwrap();
+        std::os::unix::fs::symlink(&secret, backing.join("1s/link.txt")).unwrap();
+        let link_path = RelativePath::new("1s/link.txt").unwrap();
+        let link_record = FileRecord::new(
+            link_path.clone(),
+            link_path,
+            crate::duration::Ttl::Duration(Duration::from_secs(1)),
+            "folder:1s".to_string(),
+            100,
+            Duration::from_secs(100),
+            7,
+        )
+        .unwrap();
+        store.insert_file(&link_record).unwrap();
+        store.expire_due(101).unwrap();
+        assert!(
+            recover_at(
+                &backing,
+                Path::new("1s/link.txt"),
+                &temp.path().join("escaped.txt"),
+                101,
+            )
+            .is_err()
+        );
+        assert!(!temp.path().join("escaped.txt").exists());
+    }
+
+    #[test]
+    fn open_recovery_source_survives_concurrent_gc() {
+        let temp = tempfile::tempdir().unwrap();
+        let backing = temp.path().join("backing");
+        init_backing_dir(&backing).unwrap();
+        fs::create_dir(backing.join("1s")).unwrap();
+        fs::write(backing.join("1s/race.txt"), b"still readable").unwrap();
+
+        let store = open_store(&backing).unwrap();
+        let path = RelativePath::new("1s/race.txt").unwrap();
+        let record = FileRecord::new(
+            path.clone(),
+            path,
+            crate::duration::Ttl::Duration(Duration::from_secs(1)),
+            "folder:1s".to_string(),
+            100,
+            Duration::from_secs(100),
+            14,
+        )
+        .unwrap();
+        store.insert_file(&record).unwrap();
+        store.expire_due(101).unwrap();
+
+        let mut source = File::open(backing.join("1s/race.txt")).unwrap();
+        assert!(store.is_recoverable(&record.id, 101).unwrap());
+        crate::reaper::run_once(&store, &backing, 201).unwrap();
+
+        let mut recovered = Vec::new();
+        io::copy(&mut source, &mut recovered).unwrap();
+        assert_eq!(recovered, b"still readable");
     }
 }
